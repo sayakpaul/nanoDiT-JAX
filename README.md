@@ -4,6 +4,8 @@ JAX/Flax port of [nanoDiT](https://github.com/sayakpaul/nanoDiT), with architect
 
 Targets one v6e TPU on Google Cloud or Colab. Uses bf16 computation, float32 parameters and optimizer state, gradient accumulation, host prefetching and optional activation checkpointing.
 
+[Open the miniature Colab notebook](https://colab.research.google.com/github/sayakpaul/nanoDiT-JAX/blob/main/nanoDiT_JAX.ipynb): 10-epoch demo, sample previews, checkpoint resume and a full-run option.
+
 ## Google Cloud
 
 On a v6e-1 TPU VM (`ct6e-standard-1t`, Python 3.12):
