@@ -1,39 +1,48 @@
 # nanoDiT-JAX
 
-JAX/Flax port of [nanoDiT](https://github.com/sayakpaul/nanoDiT): class-conditional, pixel-space rectified-flow training on [butterflies](https://huggingface.co/datasets/sayakpaul/butteflies_with_classes). Architecture adapted from [DiT](https://github.com/facebookresearch/DiT).
+JAX/Flax port of [nanoDiT](https://github.com/sayakpaul/nanoDiT), with architecture adapted from [DiT](https://github.com/facebookresearch/DiT). Class-conditional, pixel-space rectified flow on [butterflies](https://huggingface.co/datasets/sayakpaul/butteflies_with_classes).
 
-Targets one Colab v6e-1 TPU. Uses bf16 computation, float32 optimizer state, gradient accumulation, activation checkpointing, EMA and classifier-free guidance.
+Targets one v6e TPU on Google Cloud or Colab. Uses bf16 computation, float32 parameters and optimizer state, gradient accumulation, host prefetching and optional activation checkpointing.
 
-## Run with Colab CLI
+## Google Cloud
+
+On a v6e-1 TPU VM (`ct6e-standard-1t`, Python 3.12):
 
 ```bash
 git clone https://github.com/sayakpaul/nanoDiT-JAX.git
 cd nanoDiT-JAX
 uv venv --python 3.12
+uv pip install --python .venv/bin/python -r requirements.txt
+bash scripts/run_gcp.sh
+```
+
+The launcher downloads the dataset, benchmarks microbatch/checkpointing settings, then trains from scratch or resumes `runs/full/latest.msgpack`. Run it under a persistent service or terminal session.
+
+Matches the [original training recipe](https://github.com/sayakpaul/nanoDiT/blob/734008c/train.py): 129.6M parameters, 64×64 images, batch 128, 600 epochs (30,000 updates), AdamW at `1e-4`, weight decay `0.01`, no warmup or gradient clipping. Samples every 10 epochs use 150 Euler steps and CFG 5; checkpoints are saved every 25 epochs. Additional EMA sample grids are saved separately.
+
+`runs/full/` contains metrics, PNG/SVG loss plots, intermediate samples and the latest resumable checkpoint. To mirror artifacts to a local checkout and stop the VM after retrieving the final checkpoint:
+
+```bash
+python scripts/watch_gcp.py --project PROJECT_ID --zone ZONE --vm VM_NAME
+```
+
+The watcher must remain running locally. It copies the latest plots and sample grids into `assets/`. The VM's persistent disk retains all outputs.
+
+## Colab CLI
+
+```bash
+uv venv --python 3.12
 uv pip install --python .venv/bin/python google-colab-cli==0.7.5
 .venv/bin/python scripts/colab.py setup
-.venv/bin/python scripts/colab.py train --download --max-steps 10000
+.venv/bin/python scripts/colab.py train --download --epochs 600 --sample-ema
 .venv/bin/python scripts/colab.py fetch
 .venv/bin/python scripts/colab.py stop
 ```
 
-Complete Google sign-in when prompted. TPU runtimes have a fixed RAM configuration; Colab ignores `--high-mem`.
+Complete Google sign-in when prompted. Fetch outputs before stopping; Colab storage is temporary. Training options: `python train.py --help` in the TPU environment.
 
-Resume before stopping the runtime:
+## Training progress
 
-```bash
-.venv/bin/python scripts/colab.py train \
-  --resume runs/nanodit/latest.msgpack --max-steps 20000
-```
+Measured epoch-mean loss; incomplete runs show the completed epoch count in the title. Regenerate with `python plot_loss.py runs/gcp/full/metrics.jsonl --output-dir assets`.
 
-`fetch` saves `runs/colab-results.tar.gz` locally. Retrieve checkpoints before stopping: runtime storage is temporary. Training flags are listed by `python train.py --help` in the remote environment.
-
-If allocation times out, check for an existing runtime before retrying:
-
-```bash
-.venv/bin/colab --auth oauth2 --config .colab/sessions.json sessions
-.venv/bin/python scripts/colab.py --endpoint RUNTIME_ID attach
-.venv/bin/python scripts/colab.py install
-```
-
-Validated on v6e-1: 129.6M parameters, 64×64 images, batch 128 (microbatch 8), approximately 0.85 seconds/update after compilation. Training, sampling and checkpoint resume verified.
+![Training loss](assets/loss.png)

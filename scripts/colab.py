@@ -86,7 +86,7 @@ if process.returncode:
     def sync():
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "nanodit-source.tar.gz"
-            files = [ROOT / name for name in ["model.py", "train.py", "data.py", "requirements.txt"]]
+            files = [ROOT / name for name in ["model.py", "train.py", "data.py", "plot_loss.py", "requirements.txt"]]
             with tarfile.open(archive, "w:gz") as tar:
                 for path in files:
                     tar.add(path, arcname=path.relative_to(ROOT))
