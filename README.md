@@ -6,6 +6,21 @@ Targets one v6e TPU on Google Cloud or Colab. Uses bf16 computation, float32 par
 
 [Open the miniature Colab notebook](https://colab.research.google.com/github/sayakpaul/nanoDiT-JAX/blob/main/nanoDiT_JAX.ipynb): 10-epoch demo, sample previews, checkpoint resume and a full-run option.
 
+<img src="assets/output.gif" alt="Training samples from epochs 10 through 600" width="266">
+
+Live-weight samples every 10 epochs, from the completed 600-epoch run.
+
+## Inference
+
+[Final checkpoint on Hugging Face](https://huggingface.co/sayakpaul/nanoDiT-JAX-butterflies). After installing the dependencies below:
+
+```bash
+.venv/bin/python inference.py --class-ids 0 1 2 3 4 --samples-per-class 4 --output runs/generated.png
+.venv/bin/python inference.py --list-classes
+```
+
+Downloads the final EMA weights automatically; defaults to 150 Euler steps, CFG 5 and seed 43. The Hub also contains `checkpoint.msgpack` with live weights, EMA, optimizer and RNG state for resuming training. The Colab notebook includes a pretrained inference cell.
+
 ## Google Cloud
 
 On a v6e-1 TPU VM (`ct6e-standard-1t`, Python 3.12):
@@ -47,6 +62,6 @@ Complete Google sign-in when prompted. Fetch outputs before stopping; Colab stor
 
 ## Training progress
 
-Measured epoch-mean loss; incomplete runs show the completed epoch count in the title. Regenerate with `python plot_loss.py runs/gcp/full/metrics.jsonl --output-dir assets`.
+Measured epoch-mean loss over 600 epochs; the darker line is a 10-epoch trailing mean. Regenerate with `python plot_loss.py runs/gcp/full/metrics.jsonl --output-dir assets`.
 
-![Training loss](assets/loss.png)
+<img src="assets/loss.png" alt="Training loss over 600 epochs" width="400">
