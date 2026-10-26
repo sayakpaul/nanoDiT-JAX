@@ -28,6 +28,8 @@ python scripts/watch_gcp.py --project PROJECT_ID --zone ZONE --vm VM_NAME
 
 The watcher must remain running locally. It copies the latest plots and sample grids into `assets/`. The VM's persistent disk retains all outputs.
 
+EMA copies the first trained weights, then ramps its decay up to `0.999`. To replace an older EMA when resuming, run `bash scripts/run_gcp.sh --reset-ema` once; model weights, optimizer state and data position are restored normally. The reset is recorded in `events.jsonl`.
+
 ## Colab CLI
 
 ```bash

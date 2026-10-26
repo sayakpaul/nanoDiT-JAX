@@ -47,7 +47,15 @@ def create_state(model, seed=42, learning_rate=1e-4, warmup_steps=0, weight_deca
                              epoch_loss_sum=jnp.float32(0), epoch_loss_count=jnp.int32(0))
 
 
-def make_train_step(model, microbatch_size, ema_decay=0.9999, steps_per_epoch=50):
+def ema_decay_at_step(step, max_decay=0.999, warmup=True):
+    if not warmup:
+        return jnp.float32(max_decay)
+    # Copy the first trained weights, then gradually lengthen the averaging window.
+    step = jnp.asarray(step, dtype=jnp.float32)
+    return jnp.where(step <= 1, 0.0, jnp.minimum(max_decay, step / (step + 9)))
+
+
+def make_train_step(model, microbatch_size, ema_decay=0.999, steps_per_epoch=50, ema_warmup=True):
     def loss_fn(params, images, labels, key):
         flow_key, dropout_key = jax.random.split(key)
         x = images.astype(jnp.float32) / 127.5 - 1
@@ -73,7 +81,8 @@ def make_train_step(model, microbatch_size, ema_decay=0.9999, steps_per_epoch=50
         grads = jax.tree.map(lambda g: g / count, grads)
         grad_norm = optax.tree.norm(grads)
         state = state.apply_gradients(grads=grads)
-        ema = jax.tree.map(lambda old, new: ema_decay * old + (1 - ema_decay) * new, state.ema_params, state.params)
+        decay = ema_decay_at_step(state.step, ema_decay, ema_warmup)
+        ema = jax.tree.map(lambda old, new: old + (1 - decay) * (new - old), state.ema_params, state.params)
         loss = loss / count
         epoch_sum = state.epoch_loss_sum + loss
         epoch_count = state.epoch_loss_count + 1
@@ -121,12 +130,24 @@ def save_checkpoint(path, state, metadata):
     temporary.replace(path)
 
 
-def restore_checkpoint(path, state, metadata):
+def restore_checkpoint(path, state, metadata, reset_ema=False):
     payload = serialization.msgpack_restore(Path(path).read_bytes())
-    if payload["metadata"] != metadata:
+    saved_metadata = dict(payload["metadata"])
+    expected_metadata = dict(metadata)
+    # Checkpoints predating EMA warmup used a constant decay.
+    saved_metadata.setdefault("ema_warmup", False)
+    expected_metadata.setdefault("ema_warmup", False)
+    if reset_ema:
+        for key in ("ema_decay", "ema_warmup"):
+            saved_metadata.pop(key, None)
+            expected_metadata.pop(key, None)
+    if saved_metadata != expected_metadata:
         raise ValueError("Checkpoint model/training/data configuration differs from this run")
     restored = serialization.from_state_dict(state, payload["state"])
-    return jax.tree.map(jnp.asarray, restored)
+    restored = jax.tree.map(jnp.asarray, restored)
+    if reset_ema:
+        restored = restored.replace(ema_params=jax.tree.map(jnp.copy, restored.params))
+    return restored
 
 
 def save_grid(images, path, columns=4):
@@ -144,6 +165,7 @@ def parse_args():
     p.add_argument("--data-dir", default="butterflies")
     p.add_argument("--output-dir", default="runs/nanodit")
     p.add_argument("--resume", type=Path)
+    p.add_argument("--reset-ema", action="store_true", help="On resume, copy trained weights into EMA and allow a new EMA schedule")
     p.add_argument("--download", action="store_true")
     p.add_argument("--require-tpu", action="store_true")
     p.add_argument("--sample-ema", action="store_true", help="Also save EMA sample grids; primary samples use live weights")
@@ -155,7 +177,8 @@ def parse_args():
         p.add_argument(f"--{name}", type=int, default=default)
     p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--ema-decay", type=float, default=0.9999)
+    p.add_argument("--ema-decay", type=float, default=0.999)
+    p.add_argument("--ema-warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--cfg-scale", type=float, default=5.0)
     p.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     p.add_argument("--remat", action=argparse.BooleanOptionalAction, default=True)
@@ -170,6 +193,8 @@ def parse_args():
         p.error("steps, intervals and seed must be nonnegative")
     if not 0 <= args.ema_decay < 1:
         p.error("--ema-decay must be in [0, 1)")
+    if args.reset_ema and not args.resume:
+        p.error("--reset-ema requires --resume")
     return args
 
 
@@ -204,7 +229,7 @@ def main(args=None):
         raise ValueError("Dataset is smaller than --batch-size")
     metadata = {k: v for k, v in vars(args).items() if k not in {
         "output_dir", "resume", "download", "require_tpu", "epochs", "max_steps", "log_every",
-        "sample_every", "checkpoint_every", "ode_steps", "cfg_scale", "workers", "data_dir", "sample_ema"}}
+        "sample_every", "checkpoint_every", "ode_steps", "cfg_scale", "workers", "data_dir", "sample_ema", "reset_ema"}}
     metadata.update(classes=classes, num_images=len(dataset.labels))
     metadata["data_sha256"] = hashlib.sha256(memoryview(dataset.images)).hexdigest()
     model = NanoDiT(input_size=args.image_size, patch_size=args.patch_size, hidden_size=args.hidden_size,
@@ -212,11 +237,18 @@ def main(args=None):
                    dtype=getattr(jnp, args.dtype), remat=args.remat)
     state = create_state(model, args.seed, args.learning_rate, args.warmup_steps, args.weight_decay)
     if args.resume:
-        state = restore_checkpoint(args.resume, state, metadata)
+        state = restore_checkpoint(args.resume, state, metadata, reset_ema=args.reset_ema)
     start_step = int(state.step)
     end_step = args.max_steps or args.epochs * steps_per_epoch
     if end_step <= start_step:
         raise ValueError("Training limit must be greater than the restored step")
+    if args.reset_ema:
+        # Persist the migration immediately so subsequent resumes need no reset flag.
+        save_checkpoint(output / "latest.msgpack", state, metadata)
+        event = dict(event="ema_reset", step=start_step, ema_decay=args.ema_decay, ema_warmup=args.ema_warmup)
+        with (output / "events.jsonl").open("a") as f:
+            f.write(json.dumps(event) + "\n")
+        print(f"Reset EMA from trained weights at step {start_step}; decay cap {args.ema_decay}", flush=True)
     if args.resume and (output / "metrics.jsonl").exists():
         # Discard log entries after the restored checkpoint before replaying them.
         lines = []
@@ -235,7 +267,7 @@ def main(args=None):
     print(f"Parameters: {sum(p.size for p in jax.tree.leaves(state.params)):,}; effective batch {args.batch_size}; "
           f"microbatch {args.microbatch_size}; steps {start_step}..{end_step}", flush=True)
     batches = dataset.batches(args.batch_size, args.seed, start_step, end_step)
-    train_step = make_train_step(model, args.microbatch_size, args.ema_decay, steps_per_epoch)
+    train_step = make_train_step(model, args.microbatch_size, args.ema_decay, steps_per_epoch, args.ema_warmup)
     sampler = make_sampler(model, args.ode_steps, args.cfg_scale)
     sample_labels = jnp.repeat(jnp.arange(min(args.num_classes, 5), dtype=jnp.int32), 4)
     tick, last_log_step = time.perf_counter(), start_step

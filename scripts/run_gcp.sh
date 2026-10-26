@@ -29,7 +29,7 @@ fi
   --microbatch-size "${CONFIG[0]}" "${CONFIG[1]}" --learning-rate 1e-4 \
   --warmup-steps 0 --weight-decay 0.01 --log-every 50 \
   --sample-every 500 --checkpoint-every 1250 --ode-steps 150 --cfg-scale 5 \
-  --sample-ema --output-dir "$OUTPUT" "${RESUME[@]}"
+  --sample-ema --ema-decay 0.999 --output-dir "$OUTPUT" "${RESUME[@]}" "$@"
 touch "$OUTPUT/COMPLETE"
 sync
 # Leave time to retrieve the final checkpoint, then release compute. Disk persists.
