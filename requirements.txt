@@ -1,0 +1,7 @@
+jax[tpu]==0.12.0.1
+libtpu==0.0.50.1
+flax==0.12.10
+optax==0.2.8
+numpy==2.5.4
+pillow==13.0.0
+huggingface-hub==2.3.0

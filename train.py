@@ -1,205 +1,242 @@
-"""
-Thanks to Gemini 2.5 for pairing here and there.
-"""
+"""Rectified-flow training on one Colab TPU (also runs on CPU/GPU)."""
+import argparse
+import hashlib
+import json
+import time
+from pathlib import Path
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax import serialization
+from flax.training import train_state
+from PIL import Image
+
+from data import ImageFolder, prefetch
 from model import NanoDiT
-from torch.utils.data import DataLoader
-import torchvision.transforms as transforms
-import torchvision
-from contextlib import nullcontext
 
-# --- Hyperparameters ---
-NUM_CLASSES = 75  
-IMG_SIZE = 64
-IMG_CHANNELS = 3 
-# DiT specific parameters
-LATENT_DIM = 768
-PATCH_SIZE = 2
-MODEL_DEPTH = 12
-MODEL_HEADS = 12
-# Diffusion process parameters
-NUM_ODE_STEPS = 150
-# Training parameters
-LEARNING_RATE = 1e-4
-BATCH_SIZE = 128
-EPOCHS = 600
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-COMPILE = True
-AMP_DTYPE = torch.bfloat16 # automatic mixed-precision unless you wanna touch grass
-# Sampling parameters
-SAMPLE_INTERVAL = 10  # Sample every N epochs
-NUM_SAMPLES_PER_CLASS = 4  # Number of images to sample per class during evaluation
-CFG_SCALE = 5.0
-# Others
-CHECKPOINT_SAVE_INTERVAL = 25
-DATA_DIR = "butterflies" # Directory where the dataset is stored.
 
-# --- Helper functions for flow-matching math ---
-def flow_lerp(x):
-    bsz = x.shape[0]
-    t = torch.rand((bsz,)).to(x.device)
-    t_broadcast = t.view(bsz, 1, 1, 1)
-    z1 = torch.randn_like(x)
-    # the flow-matching lerp
-    zt = (1 - t_broadcast) * x + t_broadcast * z1
-    return zt, z1, t
+class TrainState(train_state.TrainState):
+    ema_params: object
+    rng: object
 
-# --- Sampling function (Euler) ---
-@torch.no_grad()
-def sample_conditional_cfg(
-    model, target_classes_list, ode_steps, cfg_scale=5.0, num_samples_per_cls=1, null_token_id=NUM_CLASSES
-):
-    """Generate images for specified target classes using CFG."""
-    model.eval()
-    num_target_cls = len(target_classes_list)
-    total_images_to_sample = num_samples_per_cls * num_target_cls
 
-    # Initial state
-    z = torch.randn((total_images_to_sample, IMG_CHANNELS, IMG_SIZE, IMG_SIZE), device=DEVICE)
+def flow_lerp(x, key):
+    time_key, noise_key = jax.random.split(key)
+    t = jax.random.uniform(time_key, (x.shape[0],), dtype=jnp.float32)
+    noise = jax.random.normal(noise_key, x.shape, dtype=jnp.float32)
+    tb = t[:, None, None, None]
+    return (1 - tb) * x + tb * noise, noise, t
 
-    # Prepare conditional labels
-    sample_cls_labels_list = []
-    for c_idx in target_classes_list:
-        sample_cls_labels_list.extend([c_idx] * num_samples_per_cls)
-    conditional_labels = torch.tensor(sample_cls_labels_list, device=DEVICE).long()
 
-    # CFG stuff
-    using_cfg = cfg_scale >= 1.0
-    y = conditional_labels
-    if using_cfg:
-        n = conditional_labels.shape[0]
-        y_null = torch.tensor([null_token_id] * n, device=conditional_labels.device)
-        y = torch.cat([y, y_null], 0)
+def create_state(model, seed=42, learning_rate=1e-4, warmup_steps=100, weight_decay=0.01):
+    # uint32 PRNGKey arrays serialize directly in the msgpack checkpoint.
+    init_key, train_key = jax.random.split(jax.random.PRNGKey(seed))
+    params = jax.jit(model.init)(init_key,
+        jnp.zeros((1, model.input_size, model.input_size, model.in_channels)),
+        jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32))["params"]
+    schedule = optax.linear_schedule(0.0, learning_rate, warmup_steps) if warmup_steps else learning_rate
+    # Decay matrices, including embeddings, but not biases.
+    mask = jax.tree.map(lambda p: p.ndim > 1, params)
+    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(schedule, weight_decay=weight_decay, mask=mask))
+    # Distinct buffers are important when donating the state to the training JIT.
+    return TrainState.create(apply_fn=model.apply, params=params, tx=tx,
+                             ema_params=jax.tree.map(jnp.copy, params), rng=train_key)
 
-    # ODE derivative term
-    bsz = z.shape[0]
-    dt = 1.0 / ode_steps
-    dt = torch.tensor([dt] * bsz).to(z.device).view([bsz, *([1] * len(z.shape[1:]))])
-    
-    # Flow-sampling
-    for i in range(ode_steps, 0, -1):
-        z_final = torch.cat([z, z], 0) if using_cfg else z
-        t = i / ode_steps
-        t = torch.tensor([t] * z_final.shape[0]).to(z_final.device, dtype=z_final.dtype)
-        predicted_velocity = model(z_final, t, y)
-        if using_cfg:
-            pred_cond, pred_uncond = predicted_velocity.chunk(2, dim=0)
-            predicted_velocity = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
-        # Euler step
-        z = (z - dt * predicted_velocity).to(z.dtype)
-    
-    images = (z + 1) / 2.0  # De-normalize from [-1, 1] to [0, 1]
-    images = torch.clamp(images, 0.0, 1.0)
 
-    model.train() # Set model to train.
-    return images, conditional_labels
+def make_train_step(model, microbatch_size, ema_decay=0.9999):
+    def loss_fn(params, images, labels, key):
+        flow_key, dropout_key = jax.random.split(key)
+        x = images.astype(jnp.float32) / 127.5 - 1
+        zt, noise, t = flow_lerp(x, flow_key)
+        velocity = model.apply({"params": params}, zt, t, labels, train=True, rngs={"dropout": dropout_key})
+        return jnp.mean(jnp.square(velocity - (noise - x)), dtype=jnp.float32)
 
-def train():
-    # --- Model Instantiation ---
-    model = NanoDiT(
-        input_size=IMG_SIZE,
-        patch_size=PATCH_SIZE,
-        in_channels=IMG_CHANNELS,
-        hidden_size=LATENT_DIM,
-        depth=MODEL_DEPTH,
-        num_heads=MODEL_HEADS,
-        num_classes=NUM_CLASSES,
-        timestep_freq_scale=1000,
-    ).to(DEVICE)
-    if COMPILE:
-        print("`torch.compile()` enabled.")
-        model.compile()
+    @jax.jit(donate_argnums=(0,))
+    def step(state, images, labels):
+        count = images.shape[0] // microbatch_size
+        images = images.reshape(count, microbatch_size, *images.shape[1:])
+        labels = labels.reshape(count, microbatch_size)
+        next_key, key = jax.random.split(state.rng)
+        keys = jax.random.split(key, count)
+        zeros = jax.tree.map(jnp.zeros_like, state.params)
 
-    # --- Optimizer and loss  ---
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    scaler = torch.GradScaler() if AMP_DTYPE is not None else None
-    criterion = nn.MSELoss()
-    amp_context = (
-        torch.autocast(device_type=torch.device(DEVICE).type, dtype=AMP_DTYPE) 
-        if AMP_DTYPE is not None
-        else nullcontext()
-    )
-    if AMP_DTYPE:
-        print(f"Using automatic mixed-precision in {AMP_DTYPE} (change if needed).")
+        def accumulate(carry, batch):
+            grad_sum, loss_sum = carry
+            loss, grads = jax.value_and_grad(loss_fn)(state.params, *batch)
+            return (jax.tree.map(jnp.add, grad_sum, grads), loss_sum + loss), None
 
-    # --- Dataset and DataLoader  ---
-    ds_trfs = transforms.Compose(
-        [
-            transforms.Resize(IMG_SIZE, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(IMG_SIZE),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # Normalize to [-1, 1]
-        ]
-    )
-    train_dataset = torchvision.datasets.ImageFolder(DATA_DIR, transform=ds_trfs)
-    train_classes = list(set(train_dataset.class_to_idx.values()))
-    assert NUM_CLASSES == len(train_classes)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,  # Adjust based on your system
-        pin_memory=True,  # Useful when training on GPU
-        drop_last=True,
-        prefetch_factor=2, # Adjust based on your system
-    )
+        (grads, loss), _ = jax.lax.scan(accumulate, (zeros, jnp.float32(0)), (images, labels, keys))
+        grads = jax.tree.map(lambda g: g / count, grads)
+        grad_norm = optax.tree.norm(grads)
+        state = state.apply_gradients(grads=grads)
+        ema = jax.tree.map(lambda old, new: ema_decay * old + (1 - ema_decay) * new, state.ema_params, state.params)
+        return state.replace(ema_params=ema, rng=next_key), {"loss": loss / count, "grad_norm": grad_norm}
 
-    # --- Training Loop ---
-    print(f"Training on {DEVICE}")
-    print(f"Using custom model: {type(model).__name__}")
-    print(f"Model Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    
-    for epoch in range(EPOCHS):
-        model.train()
-        for step, (real_images, class_ids) in enumerate(train_dataloader):
-            optimizer.zero_grad()
-            real_images = real_images.to(DEVICE, non_blocking=True)  # Shape: (B, C, H, W)
-            class_ids = class_ids.to(DEVICE, non_blocking=True)  # Shape: (B,)
+    return step
 
-            # 1. Interpolate between clean data and noise
-            zt, z1, t = flow_lerp(real_images)
-            # 2. Target velocity: u_t = x1 - x0
-            target_velocity_field = z1 - real_images
-            with amp_context:
-                # 3. Predict velocity using the model
-                predicted_velocity = model(zt, t, class_ids)
-                # 4. Calculate loss
-                loss = criterion(target_velocity_field, predicted_velocity)
-            # 5. Backpropagate and update weights
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
 
-            if (step + 1) % 50 == 0:  # Log less frequently
-                print(f"Epoch [{epoch + 1}/{EPOCHS}], Step [{step + 1}/{len(train_dataloader)}], Loss: {loss.item():.4f}")
+def make_sampler(model, ode_steps=150, cfg_scale=5.0):
+    if ode_steps <= 0:
+        raise ValueError("ode_steps must be positive")
 
-        # --- Perform Sampling and Save Images (Intermediate Evaluation) ---
-        if (epoch + 1) % SAMPLE_INTERVAL == 0 or epoch == EPOCHS - 1:
-            print(f"\nSampling images at epoch {epoch + 1}...")
-            classes_to_sample_list = list(range(min(NUM_CLASSES, 5)))
-            generated_sample_images, _ = sample_conditional_cfg(
-                model, classes_to_sample_list, ode_steps=NUM_ODE_STEPS,
-                cfg_scale=CFG_SCALE, num_samples_per_cls=NUM_SAMPLES_PER_CLASS
-            )
-            # Save as a grid
-            if generated_sample_images.nelement() > 0:  # Check if any images were generated
-                grid = torchvision.utils.make_grid(generated_sample_images, nrow=NUM_SAMPLES_PER_CLASS)
-                torchvision.utils.save_image(grid, f"sample_epoch_{epoch + 1}.png")
-                print(f"Saved sample images to sample_epoch_{epoch + 1}.png")
-            print("-" * 30)
+    @jax.jit
+    def sample(params, key, labels):
+        z = jax.random.normal(key, (labels.shape[0], model.input_size, model.input_size, model.in_channels))
+        use_cfg = cfg_scale != 1.0
+        y = jnp.concatenate([labels, jnp.full_like(labels, model.num_classes)]) if use_cfg else labels
 
-        # Optional: Save model checkpoint
-        if (epoch + 1) % CHECKPOINT_SAVE_INTERVAL == 0:
-            torch.save(model.state_dict(), f"dit_conditional_epoch_{epoch + 1}.pth")
+        def euler(i, z):
+            inputs = jnp.concatenate([z, z]) if use_cfg else z
+            t = jnp.full((inputs.shape[0],), 1.0 - i / ode_steps, dtype=jnp.float32)
+            v = model.apply({"params": params}, inputs, t, y)
+            if use_cfg:
+                cond, uncond = jnp.split(v, 2)
+                v = uncond + cfg_scale * (cond - uncond)
+            return z - v / ode_steps
 
-    print("Training finished.")
+        z = jax.lax.fori_loop(0, ode_steps, euler, z)
+        return jnp.clip((z + 1) / 2, 0, 1)
+
+    return sample
+
+
+def save_checkpoint(path, state, metadata):
+    """Atomic single-host checkpoint including optimizer, EMA, RNG and data position."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"state": serialization.to_state_dict(jax.device_get(state)), "metadata": metadata}
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(serialization.msgpack_serialize(payload))
+    temporary.replace(path)
+
+
+def restore_checkpoint(path, state, metadata):
+    payload = serialization.msgpack_restore(Path(path).read_bytes())
+    if payload["metadata"] != metadata:
+        raise ValueError("Checkpoint model/training/data configuration differs from this run")
+    restored = serialization.from_state_dict(state, payload["state"])
+    return jax.tree.map(jnp.asarray, restored)
+
+
+def save_grid(images, path, columns=4):
+    images = np.uint8(np.clip(np.asarray(images), 0, 1) * 255)
+    n, h, w, c = images.shape
+    grid = np.zeros(((n + columns - 1) // columns * h, columns * w, c), dtype=np.uint8)
+    for i, image in enumerate(images):
+        row, col = divmod(i, columns)
+        grid[row * h:(row + 1) * h, col * w:(col + 1) * w] = image
+    Image.fromarray(grid).save(path)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--data-dir", default="butterflies")
+    p.add_argument("--output-dir", default="runs/nanodit")
+    p.add_argument("--resume", type=Path)
+    p.add_argument("--download", action="store_true")
+    p.add_argument("--require-tpu", action="store_true")
+    for name, default in [("image-size", 64), ("patch-size", 2), ("hidden-size", 768),
+        ("depth", 12), ("num-heads", 12), ("num-classes", 75), ("batch-size", 128),
+        ("microbatch-size", 8), ("epochs", 600), ("max-steps", 0), ("seed", 42),
+        ("warmup-steps", 100), ("log-every", 10), ("sample-every", 500),
+        ("checkpoint-every", 500), ("ode-steps", 150), ("workers", 8)]:
+        p.add_argument(f"--{name}", type=int, default=default)
+    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--ema-decay", type=float, default=0.9999)
+    p.add_argument("--cfg-scale", type=float, default=5.0)
+    p.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
+    p.add_argument("--remat", action=argparse.BooleanOptionalAction, default=True)
+    args = p.parse_args()
+    for name in ["image_size", "patch_size", "hidden_size", "depth", "num_heads", "num_classes",
+                 "batch_size", "microbatch_size", "epochs", "log_every", "ode_steps", "workers"]:
+        if getattr(args, name) <= 0:
+            p.error(f"--{name.replace('_', '-')} must be positive")
+    if args.batch_size % args.microbatch_size:
+        p.error("--batch-size must be divisible by --microbatch-size")
+    if min(args.max_steps, args.warmup_steps, args.sample_every, args.checkpoint_every, args.seed) < 0:
+        p.error("steps, intervals and seed must be nonnegative")
+    if not 0 <= args.ema_decay < 1:
+        p.error("--ema-decay must be in [0, 1)")
+    return args
+
+
+def main():
+    args = parse_args()
+    if args.require_tpu and jax.default_backend() != "tpu":
+        raise RuntimeError(f"A TPU was requested but JAX selected {jax.default_backend()}: {jax.devices()}")
+    if jax.device_count() != 1:
+        raise RuntimeError("This trainer targets a single device (Colab v6e-1); multi-device sharding is not configured")
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    if (output / "latest.msgpack").exists() and args.resume is None:
+        raise ValueError("Output already contains a checkpoint; use --resume or a new --output-dir")
+    jax.config.update("jax_compilation_cache_dir", str(output / "jax_cache"))
+    print(f"JAX {jax.__version__}; devices: {jax.devices()}; compute: {args.dtype}", flush=True)
+    if args.download:
+        from huggingface_hub import snapshot_download
+        snapshot_download("sayakpaul/butteflies_with_classes", repo_type="dataset", local_dir=args.data_dir)
+    dataset = ImageFolder(args.data_dir, args.image_size, args.workers)
+    classes = dataset.classes
+    if len(classes) != args.num_classes:
+        raise ValueError(f"Expected {args.num_classes} classes, found {len(classes)}: {classes}")
+    steps_per_epoch = len(dataset.labels) // args.batch_size
+    if not steps_per_epoch:
+        raise ValueError("Dataset is smaller than --batch-size")
+    metadata = {k: v for k, v in vars(args).items() if k not in {
+        "output_dir", "resume", "download", "require_tpu", "epochs", "max_steps", "log_every",
+        "sample_every", "checkpoint_every", "ode_steps", "cfg_scale", "workers", "data_dir"}}
+    metadata.update(classes=classes, num_images=len(dataset.labels))
+    metadata["data_sha256"] = hashlib.sha256(memoryview(dataset.images)).hexdigest()
+    model = NanoDiT(input_size=args.image_size, patch_size=args.patch_size, hidden_size=args.hidden_size,
+                   depth=args.depth, num_heads=args.num_heads, num_classes=args.num_classes,
+                   dtype=getattr(jnp, args.dtype), remat=args.remat)
+    state = create_state(model, args.seed, args.learning_rate, args.warmup_steps, args.weight_decay)
+    if args.resume:
+        state = restore_checkpoint(args.resume, state, metadata)
+    start_step = int(state.step)
+    end_step = args.max_steps or args.epochs * steps_per_epoch
+    if end_step <= start_step:
+        raise ValueError("Training limit must be greater than the restored step")
+    (output / "config.json").write_text(json.dumps(metadata, indent=2))
+    print(f"Parameters: {sum(p.size for p in jax.tree.leaves(state.params)):,}; effective batch {args.batch_size}; "
+          f"microbatch {args.microbatch_size}; steps {start_step}..{end_step}", flush=True)
+    batches = dataset.batches(args.batch_size, args.seed, start_step, end_step)
+    train_step = make_train_step(model, args.microbatch_size, args.ema_decay)
+    sampler = make_sampler(model, args.ode_steps, args.cfg_scale)
+    sample_labels = jnp.repeat(jnp.arange(min(args.num_classes, 5), dtype=jnp.int32), 4)
+    tick, last_log_step = time.perf_counter(), start_step
+    for step, (images, labels) in enumerate(prefetch(iter(batches)), start_step + 1):
+        state, metrics = train_step(state, jax.device_put(images), jax.device_put(labels))
+        if step == start_step + 1 or step % args.log_every == 0 or step == end_step:
+            metrics = jax.device_get(metrics)  # Synchronize only at logging/checkpoint boundaries.
+            elapsed = time.perf_counter() - tick
+            if not all(np.isfinite(v) for v in metrics.values()):
+                raise FloatingPointError(f"Nonfinite training metrics at step {step}: {metrics}")
+            record = dict(step=step, loss=float(metrics["loss"]), grad_norm=float(metrics["grad_norm"]),
+                          seconds_per_step=elapsed / (step - last_log_step))
+            print(json.dumps(record), flush=True)
+            with (output / "metrics.jsonl").open("a") as f:
+                f.write(json.dumps(record) + "\n")
+            tick, last_log_step = time.perf_counter(), step
+        if args.sample_every and (step % args.sample_every == 0 or step == end_step):
+            images = sampler(state.ema_params, jax.random.PRNGKey(args.seed + 1), sample_labels)
+            save_grid(images, output / f"samples_{step:07d}.png")
+            tick = time.perf_counter()
+            last_log_step = step
+        if (args.checkpoint_every and step % args.checkpoint_every == 0) or step == end_step:
+            save_checkpoint(output / "latest.msgpack", state, metadata)
+            tick = time.perf_counter()
+            last_log_step = step
+    summary = dict(step=end_step, parameter_count=sum(p.size for p in jax.tree.leaves(state.params)),
+                   jax_version=jax.__version__, device=jax.devices()[0].device_kind,
+                   dtype=args.dtype, memory_stats=jax.devices()[0].memory_stats())
+    (output / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary), flush=True)
+    print(f"Finished. Checkpoint: {output / 'latest.msgpack'}", flush=True)
+
 
 if __name__ == "__main__":
-    train()
+    main()
